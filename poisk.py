@@ -1,66 +1,74 @@
 import os
-import csv
+import subprocess
 import numpy as np
+import pandas as pd
 import librosa
+import tensorflow_hub as hub
 from static_ffmpeg import add_paths
 
 add_paths()
 
-print("--- ЗАПУСК ГАРМОНИЧЕСКОГО ДЕТЕКТОРА (ПОИСК МЕЛОДИЙ) ---")
-BASE_PATH = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_FILE = os.path.join(BASE_PATH, 'MUSICAL_MOMENTS_FOUND.csv')
+model = hub.load('https://tfhub.dev/google/yamnet/1')
+class_map_path = model.class_map_path().numpy()
+class_names = [line.split(',')[2].strip('"') for line in open(class_map_path).readlines()[1:]]
 
-def format_time(seconds):
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02d}:{s:02d}"
+target_sounds = ['Music', 'Singing', 'Musical instrument', 'Child singing', 'Humming', 'Lullaby']
+base_dir = './corpus'
+output_dir = './clips'
+if not os.path.exists(output_dir): os.makedirs(output_dir)
 
-with open(OUTPUT_FILE, mode='w', newline='', encoding='utf-8') as f:
-    writer = csv.writer(f)
-    writer.writerow(['Child', 'File', 'Start', 'End', 'Duration', 'Melodic_Score'])
+results = []
 
-    for child in ['Yasha', 'Tosya']:
-        folder_path = os.path.join(BASE_PATH, child)
-        if not os.path.exists(folder_path): continue
-        
-        files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.mts'))]
-        
-        for file_name in files:
-            print(f"Анализ: {child} -> {file_name}")
-            try:
-                y, sr = librosa.load(os.path.join(folder_path, file_name), sr=16000)
-                if len(y) == 0: continue
-                
-                # Отделяем чистые тона (гармоники) от шума
-                y_harm, y_perc = librosa.effects.hpss(y)
-                
-                # Считаем энергию по секундам
-                step = 16000
-                h_energy = np.array([np.sum(y_harm[i:i+step]**2) for i in range(0, len(y_harm), step)])
-                p_energy = np.array([np.sum(y_perc[i:i+step]**2) for i in range(0, len(y_perc), step)])
-                
-                # Коэффициент певучести
-                ratios = h_energy / (p_energy + 0.0001)
-                
-                cur = None
-                found = 0
-                
-                for i, ratio in enumerate(ratios):
-                    if ratio > 2.5: # Если мелодия в 2.5 раза чище шума
-                        if cur is None:
-                            cur = {'start': i, 'max': ratio}
-                        cur['end'] = i + 1
-                        cur['max'] = max(cur['max'], ratio)
-                    else:
-                        if cur:
-                            dur = cur['end'] - cur['start']
-                            if dur >= 2:
-                                writer.writerow([child, file_name, format_time(cur['start']), format_time(cur['end']), dur, round(float(cur['max']), 1)])
-                                found += 1
-                            cur = None
-                f.flush()
-                print(f"   Найдено фрагментов: {found}")
-            except Exception as e:
-                print(f"   Ошибка в {file_name}: {e}")
+for child in ['Tosya', 'Yasha']:
+    path = os.path.join(base_dir, child)
+    if not os.path.exists(path): continue
+    files = [f for f in os.listdir(path) if f.lower().endswith(('.mp4', '.avi', '.mts'))]
 
-print(f"\nАНАЛИЗ ЗАВЕРШЕН! Файл: {OUTPUT_FILE}")
-input("Нажмите Enter...")
+    for f in files:
+        try:
+            y, sr = librosa.load(os.path.join(path, f), sr=16000)
+            scores, _, _ = model(y)
+            scores_np = scores.numpy()
+
+            for i, frame in enumerate(scores_np):
+                label = class_names[np.argmax(frame)]
+                conf = np.max(frame)
+                time = i * 0.48
+
+                s_s = int(time * sr)
+                e_s = int((time + 0.48) * sr)
+                y_h, y_p = librosa.effects.hpss(y[s_s:e_s])
+                m_score = np.sum(y_h**2) / (np.sum(y_p**2) + 1e-6)
+
+                if (label in target_sounds and conf > 0.15) or (label == 'Child speech' and m_score > 2.5):
+                    results.append([child, f, time, label, m_score])
+        except:
+            continue
+
+df = pd.DataFrame(results, columns=['Child', 'File', 'Start', 'Label', 'Score'])
+
+final_list = []
+for (child, file), group in df.groupby(['Child', 'File']):
+    group = group.sort_values('Start')
+    if group.empty: continue
+    s_start = group.iloc[0]['Start']
+    s_last = s_start
+    for idx in range(1, len(group)):
+        curr = group.iloc[idx]['Start']
+        if curr - s_last <= 15:
+            s_last = curr
+        else:
+            final_list.append([child, file, s_start, s_last + 2])
+            s_start = curr
+            s_last = curr
+    final_list.append([child, file, s_start, s_last + 2])
+
+for res in final_list:
+    child, file, start, end = res
+    dur = end - start
+    if dur < 2.5: continue
+    out = os.path.join(output_dir, f"{child}_{int(start)}_{file}")
+    inp = os.path.join(base_dir, child, file)
+    cmd = ['ffmpeg', '-y', '-ss', str(start), '-t', str(dur), '-i', inp, 
+           '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', out]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
